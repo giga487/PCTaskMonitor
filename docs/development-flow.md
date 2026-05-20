@@ -41,6 +41,12 @@ Gli step sono:
 7. publish dell'eseguibile `PCMonitor`;
 8. upload dell'artifact di build.
 
+## Configurazione monitoraggio task
+
+La sezione `Monitoring:TrackedTasks` in `PCMonitor/appsettings.json` abilita il tracciamento periodico di processi specifici. Ogni ciclo di campionamento scrive nel log una riga per ogni nome configurato, indicando se il task e' in esecuzione, quanti processi sono presenti, i PID e la CPU totale calcolata dal campione precedente.
+
+I nomi possono essere indicati con o senza estensione `.exe`; il confronto non distingue maiuscole/minuscole.
+
 ## Regole di qualita'
 
 `Directory.Build.props` applica a tutti i progetti:

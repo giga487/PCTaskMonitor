@@ -166,10 +166,11 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
     private static void LogSettingsReloaded(MonitoringSettings settings)
     {
         Log.Information(
-            "Monitoring settings loaded. Process CPU threshold: {CpuThreshold:P2}. Total CPU threshold: {TotalCpuThreshold:P2}. Top CPU processes: {TopProcessCount}. Network total threshold: {NetworkThreshold} B/s. Sample interval: {IntervalSeconds}s",
+            "Monitoring settings loaded. Process CPU threshold: {CpuThreshold:P2}. Total CPU threshold: {TotalCpuThreshold:P2}. Top CPU processes: {TopProcessCount}. Tracked task names: {TrackedTaskNames}. Network total threshold: {NetworkThreshold} B/s. Sample interval: {IntervalSeconds}s",
             settings.ProcessCpuThresholdPercent / 100,
             settings.TotalCpuThresholdPercent / 100,
             settings.GetTopCpuProcessesCount(),
+            string.Join(", ", settings.TrackedTasks.GetNormalizedNames()),
             settings.Network.TotalBytesPerSecondThreshold,
             settings.GetSampleInterval().TotalSeconds);
     }
@@ -178,8 +179,11 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
     {
         HashSet<int> observedProcessIds = [];
         List<ProcessCpuUsage> currentCpuUsages = [];
+        List<ProcessCpuUsage> trackedTaskUsages = [];
+        Dictionary<string, List<int>> trackedTaskProcessIds = new(StringComparer.OrdinalIgnoreCase);
         double totalCpuSeconds = 0;
         double longestElapsedSeconds = 0;
+        HashSet<string> trackedTaskNames = settings.TrackedTasks.GetNormalizedNameSet();
 
         foreach (Process process in Process.GetProcesses())
         {
@@ -192,6 +196,17 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
                 }
 
                 observedProcessIds.Add(snapshot.ProcessId);
+
+                if (settings.TrackedTasks.Enabled && trackedTaskNames.Contains(snapshot.ProcessName))
+                {
+                    if (!trackedTaskProcessIds.TryGetValue(snapshot.ProcessName, out List<int>? processIds))
+                    {
+                        processIds = [];
+                        trackedTaskProcessIds[snapshot.ProcessName] = processIds;
+                    }
+
+                    processIds.Add(snapshot.ProcessId);
+                }
 
                 if (!_processSamples.TryGetValue(snapshot.ProcessId, out ProcessSample? previous))
                 {
@@ -209,6 +224,14 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
                     snapshot.ProcessName,
                     cpuPercent));
 
+                if (settings.TrackedTasks.Enabled && trackedTaskNames.Contains(snapshot.ProcessName))
+                {
+                    trackedTaskUsages.Add(new ProcessCpuUsage(
+                        snapshot.ProcessId,
+                        snapshot.ProcessName,
+                        cpuPercent));
+                }
+
                 _processSamples[snapshot.ProcessId] = new ProcessSample(snapshot.TotalProcessorTime, sampleTime);
 
                 if (cpuPercent > settings.ProcessCpuThresholdPercent)
@@ -224,7 +247,52 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
         }
 
         CheckTotalCpuThreshold(settings, currentCpuUsages, totalCpuSeconds, longestElapsedSeconds);
+        TraceConfiguredTasks(sampleTime, settings, trackedTaskProcessIds, trackedTaskUsages);
         RemoveExitedProcesses(observedProcessIds);
+    }
+
+    private static void TraceConfiguredTasks(
+        DateTimeOffset sampleTime,
+        MonitoringSettings settings,
+        Dictionary<string, List<int>> trackedTaskProcessIds,
+        List<ProcessCpuUsage> trackedTaskUsages)
+    {
+        if (!settings.TrackedTasks.Enabled)
+        {
+            return;
+        }
+
+        List<string> taskNames = settings.TrackedTasks.GetNormalizedNames();
+        if (taskNames.Count == 0)
+        {
+            return;
+        }
+
+        var runningTasksByName = trackedTaskUsages
+            .GroupBy(process => process.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (string taskName in taskNames)
+        {
+            if (!trackedTaskProcessIds.TryGetValue(taskName, out List<int>? processIds))
+            {
+                Log.Information(
+                    "Tracked task sample. SampleTime={SampleTime:O} TaskName={TaskName} RunningCount=0",
+                    sampleTime,
+                    taskName);
+                continue;
+            }
+
+            runningTasksByName.TryGetValue(taskName, out List<ProcessCpuUsage>? runningTasks);
+
+            Log.Information(
+                "Tracked task sample. SampleTime={SampleTime:O} TaskName={TaskName} RunningCount={RunningCount} TotalCpuPercent={TotalCpuPercent:F2} Pids={ProcessIds}",
+                sampleTime,
+                taskName,
+                processIds.Count,
+                runningTasks?.Sum(process => process.CpuPercent) ?? 0,
+                string.Join(", ", processIds));
+        }
     }
 
     private static void CheckTotalCpuThreshold(
@@ -425,6 +493,8 @@ internal sealed class MonitoringSettings
     }
 
     public NetworkMonitoringSettings Network { get; init; } = new();
+
+    public TrackedTasksSettings TrackedTasks { get; init; } = new();
 }
 
 internal sealed class NetworkMonitoringSettings
@@ -438,6 +508,27 @@ internal sealed class NetworkMonitoringSettings
     public double SentBytesPerSecondThreshold { get; init; } = 10 * 1024 * 1024;
 
     public double TotalBytesPerSecondThreshold { get; init; } = 20 * 1024 * 1024;
+}
+
+internal sealed class TrackedTasksSettings
+{
+    public bool Enabled { get; init; }
+
+    public List<string> Names { get; init; } = [];
+
+    public List<string> GetNormalizedNames()
+    {
+        return Names
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => Path.GetFileNameWithoutExtension(name.Trim()))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    public HashSet<string> GetNormalizedNameSet()
+    {
+        return GetNormalizedNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
 }
 
 internal sealed class LoggingSettings
