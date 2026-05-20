@@ -30,14 +30,14 @@ internal static class Program
         builder.Services.AddDirectoryBrowser();
         builder.Services.AddHostedService<TaskMonitor>();
 
-        ConfigureLogging(ReadLoggingSettings(builder.Configuration.GetSection("Logging")));
+        ConfigureLogging(ReadLoggingSettings(builder.Configuration.GetSection("AppLogging")));
 
         try
         {
             await using WebApplication app = builder.Build();
             MapLogStaticFiles(
                 app,
-                ReadLoggingSettings(builder.Configuration.GetSection("Logging")),
+                ReadLoggingSettings(builder.Configuration.GetSection("AppLogging")),
                 ReadLogStaticFilesSettings(builder.Configuration.GetSection("LogStaticFiles")));
 
             await app.RunAsync().ConfigureAwait(false);
