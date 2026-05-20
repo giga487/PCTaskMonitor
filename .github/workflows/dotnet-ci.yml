@@ -1,0 +1,70 @@
+name: dotnet-ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  SOLUTION_PATH: PCMonitor/PCMonitor.sln
+
+jobs:
+  validate:
+    name: Restore, build, test, publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore $env:SOLUTION_PATH
+
+      - name: Build
+        run: dotnet build $env:SOLUTION_PATH --configuration Release --no-restore -warnaserror
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $testProjects = Get-ChildItem -Path . -Recurse -Filter *.csproj |
+            Where-Object { $_.FullName -match '(?i)(test|tests)' }
+
+          if (-not $testProjects) {
+            Write-Host "No test projects found. Skipping dotnet test."
+            return
+          }
+
+          foreach ($project in $testProjects) {
+            dotnet test $project.FullName --configuration Release --no-build --logger "trx;LogFileName=$($project.BaseName).trx" --results-directory TestResults
+          }
+
+      - name: Publish
+        run: dotnet publish PCMonitor/PCMonitor.csproj --configuration Release --no-build --output artifacts/PCMonitor
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCMonitor-${{ github.sha }}
+          path: artifacts/PCMonitor
