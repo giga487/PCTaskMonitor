@@ -51,11 +51,18 @@ Quando e' abilitato, per ogni nome configurato viene scritta una riga di log con
 
 - `TaskName`: nome del processo monitorato;
 - `RunningCount`: quante istanze sono in esecuzione;
-- `TotalCpuPercent`: CPU totale delle istanze trovate;
+- `CPU`: CPU totale corrente delle istanze trovate, seguita dall'incremento percentuale relativo al campionamento precedente;
+- `RAM`: memoria corrente totale delle istanze trovate, seguita dall'incremento percentuale relativo al campionamento precedente;
 - `Pids`: PID delle istanze;
 - `SampleTime`: timestamp del campionamento.
 
-I nomi possono essere indicati con o senza `.exe`; il confronto non distingue maiuscole/minuscole. La CPU e' significativa dal secondo campionamento in poi, perche' viene calcolata confrontando il campione corrente con quello precedente.
+Esempio di riga:
+
+```text
+Tracked task sample. TaskName=PCMonitor RunningCount=1 CPU: 2.15% (+12.4%) RAM: 83.50 MB (-3.1%) Pids=1234
+```
+
+I nomi possono essere indicati con o senza `.exe`; il confronto non distingue maiuscole/minuscole. Gli incrementi sono numeri relativi e firmati: positivi quando il valore aumenta, negativi quando diminuisce. La CPU e' significativa dal secondo campionamento in poi, perche' viene calcolata confrontando il campione corrente con quello precedente.
 
 ### Network
 

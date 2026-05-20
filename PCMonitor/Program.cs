@@ -133,6 +133,7 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
 {
     private readonly Dictionary<int, ProcessSample> _processSamples = [];
     private readonly Dictionary<string, NetworkSample> _networkSamples = [];
+    private readonly Dictionary<string, TrackedTaskSample> _trackedTaskSamples = new(StringComparer.OrdinalIgnoreCase);
     private readonly IDisposable? _settingsChangeRegistration = optionsMonitor.OnChange(LogSettingsReloaded);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -179,8 +180,7 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
     {
         HashSet<int> observedProcessIds = [];
         List<ProcessCpuUsage> currentCpuUsages = [];
-        List<ProcessCpuUsage> trackedTaskUsages = [];
-        Dictionary<string, List<int>> trackedTaskProcessIds = new(StringComparer.OrdinalIgnoreCase);
+        List<TrackedProcessUsage> trackedTaskUsages = [];
         double totalCpuSeconds = 0;
         double longestElapsedSeconds = 0;
         HashSet<string> trackedTaskNames = settings.TrackedTasks.GetNormalizedNameSet();
@@ -197,20 +197,10 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
 
                 observedProcessIds.Add(snapshot.ProcessId);
 
-                if (settings.TrackedTasks.Enabled && trackedTaskNames.Contains(snapshot.ProcessName))
-                {
-                    if (!trackedTaskProcessIds.TryGetValue(snapshot.ProcessName, out List<int>? processIds))
-                    {
-                        processIds = [];
-                        trackedTaskProcessIds[snapshot.ProcessName] = processIds;
-                    }
-
-                    processIds.Add(snapshot.ProcessId);
-                }
-
                 if (!_processSamples.TryGetValue(snapshot.ProcessId, out ProcessSample? previous))
                 {
                     _processSamples[snapshot.ProcessId] = new ProcessSample(snapshot.TotalProcessorTime, sampleTime);
+                    AddTrackedTaskUsage(settings, trackedTaskNames, trackedTaskUsages, snapshot, cpuPercent: 0);
                     continue;
                 }
 
@@ -224,13 +214,7 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
                     snapshot.ProcessName,
                     cpuPercent));
 
-                if (settings.TrackedTasks.Enabled && trackedTaskNames.Contains(snapshot.ProcessName))
-                {
-                    trackedTaskUsages.Add(new ProcessCpuUsage(
-                        snapshot.ProcessId,
-                        snapshot.ProcessName,
-                        cpuPercent));
-                }
+                AddTrackedTaskUsage(settings, trackedTaskNames, trackedTaskUsages, snapshot, cpuPercent);
 
                 _processSamples[snapshot.ProcessId] = new ProcessSample(snapshot.TotalProcessorTime, sampleTime);
 
@@ -247,15 +231,33 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
         }
 
         CheckTotalCpuThreshold(settings, currentCpuUsages, totalCpuSeconds, longestElapsedSeconds);
-        TraceConfiguredTasks(sampleTime, settings, trackedTaskProcessIds, trackedTaskUsages);
+        TraceConfiguredTasks(sampleTime, settings, trackedTaskUsages);
         RemoveExitedProcesses(observedProcessIds);
     }
 
-    private static void TraceConfiguredTasks(
+    private static void AddTrackedTaskUsage(
+        MonitoringSettings settings,
+        HashSet<string> trackedTaskNames,
+        List<TrackedProcessUsage> trackedTaskUsages,
+        ProcessSnapshot snapshot,
+        double cpuPercent)
+    {
+        if (!settings.TrackedTasks.Enabled || !trackedTaskNames.Contains(snapshot.ProcessName))
+        {
+            return;
+        }
+
+        trackedTaskUsages.Add(new TrackedProcessUsage(
+            snapshot.ProcessId,
+            snapshot.ProcessName,
+            cpuPercent,
+            snapshot.WorkingSetBytes));
+    }
+
+    private void TraceConfiguredTasks(
         DateTimeOffset sampleTime,
         MonitoringSettings settings,
-        Dictionary<string, List<int>> trackedTaskProcessIds,
-        List<ProcessCpuUsage> trackedTaskUsages)
+        List<TrackedProcessUsage> trackedTaskUsages)
     {
         if (!settings.TrackedTasks.Enabled)
         {
@@ -274,25 +276,57 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
 
         foreach (string taskName in taskNames)
         {
-            if (!trackedTaskProcessIds.TryGetValue(taskName, out List<int>? processIds))
+            if (!runningTasksByName.TryGetValue(taskName, out List<TrackedProcessUsage>? runningTasks))
             {
+                double cpuChangePercent = GetRelativeChangePercent(_trackedTaskSamples.GetValueOrDefault(taskName)?.CpuPercent, 0);
+                double memoryChangePercent = GetRelativeChangePercent(_trackedTaskSamples.GetValueOrDefault(taskName)?.WorkingSetBytes, 0);
+
                 Log.Information(
-                    "Tracked task sample. SampleTime={SampleTime:O} TaskName={TaskName} RunningCount=0",
+                    "Tracked task sample. SampleTime={SampleTime:O} TaskName={TaskName} RunningCount=0 CPU: {CpuPercent:F2}% ({CpuChangePercent:+0.##;-0.##;0}%) RAM: {MemoryMegabytes:F2} MB ({MemoryChangePercent:+0.##;-0.##;0}%)",
                     sampleTime,
-                    taskName);
+                    taskName,
+                    0,
+                    cpuChangePercent,
+                    0,
+                    memoryChangePercent);
+                _trackedTaskSamples[taskName] = new TrackedTaskSample(0, 0, sampleTime);
                 continue;
             }
 
-            runningTasksByName.TryGetValue(taskName, out List<ProcessCpuUsage>? runningTasks);
+            double cpuPercent = runningTasks.Sum(process => process.CpuPercent);
+            long workingSetBytes = runningTasks.Sum(process => process.WorkingSetBytes);
+            _trackedTaskSamples.TryGetValue(taskName, out TrackedTaskSample? previous);
+            double cpuIncrementPercent = GetRelativeChangePercent(previous?.CpuPercent, cpuPercent);
+            double memoryIncrementPercent = GetRelativeChangePercent(previous?.WorkingSetBytes, workingSetBytes);
 
             Log.Information(
-                "Tracked task sample. SampleTime={SampleTime:O} TaskName={TaskName} RunningCount={RunningCount} TotalCpuPercent={TotalCpuPercent:F2} Pids={ProcessIds}",
+                "Tracked task sample. SampleTime={SampleTime:O} TaskName={TaskName} RunningCount={RunningCount} CPU: {CpuPercent:F2}% ({CpuIncrementPercent:+0.##;-0.##;0}%) RAM: {MemoryMegabytes:F2} MB ({MemoryIncrementPercent:+0.##;-0.##;0}%) Pids={ProcessIds}",
                 sampleTime,
                 taskName,
-                processIds.Count,
-                runningTasks?.Sum(process => process.CpuPercent) ?? 0,
-                string.Join(", ", processIds));
+                runningTasks.Count,
+                cpuPercent,
+                cpuIncrementPercent,
+                workingSetBytes / 1024d / 1024d,
+                memoryIncrementPercent,
+                string.Join(", ", runningTasks.Select(process => process.ProcessId)));
+
+            _trackedTaskSamples[taskName] = new TrackedTaskSample(cpuPercent, workingSetBytes, sampleTime);
         }
+    }
+
+    private static double GetRelativeChangePercent(double? previousValue, double currentValue)
+    {
+        if (previousValue is null)
+        {
+            return 0;
+        }
+
+        if (Math.Abs(previousValue.Value) < double.Epsilon)
+        {
+            return currentValue > 0 ? 100 : 0;
+        }
+
+        return (currentValue - previousValue.Value) / previousValue.Value * 100;
     }
 
     private static void CheckTotalCpuThreshold(
@@ -395,7 +429,8 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
             return new ProcessSnapshot(
                 process.Id,
                 process.ProcessName,
-                process.TotalProcessorTime);
+                process.TotalProcessorTime,
+                process.WorkingSet64);
         }
         catch (InvalidOperationException)
         {
@@ -461,16 +496,25 @@ internal sealed class TaskMonitor(IOptionsMonitor<MonitoringSettings> optionsMon
 internal sealed record ProcessSnapshot(
     int ProcessId,
     string ProcessName,
-    TimeSpan TotalProcessorTime);
+    TimeSpan TotalProcessorTime,
+    long WorkingSetBytes);
 
 internal sealed record ProcessCpuUsage(
     int ProcessId,
     string ProcessName,
     double CpuPercent);
 
+internal sealed record TrackedProcessUsage(
+    int ProcessId,
+    string ProcessName,
+    double CpuPercent,
+    long WorkingSetBytes);
+
 internal sealed record ProcessSample(TimeSpan TotalProcessorTime, DateTimeOffset SampleTime);
 
 internal sealed record NetworkSample(long BytesReceived, long BytesSent, DateTimeOffset SampleTime);
+
+internal sealed record TrackedTaskSample(double CpuPercent, long WorkingSetBytes, DateTimeOffset SampleTime);
 
 internal sealed class MonitoringSettings
 {
